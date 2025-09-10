@@ -24,7 +24,9 @@ param(
     [switch]$Help = $false,
     [switch]$ShowDetailedBreakdown = $false,
     [datetime]$StartDate = (Get-Date "2025-05-01"),
-    [datetime]$EndDate = (Get-Date "2025-05-31")
+    [datetime]$EndDate = (Get-Date "2025-05-31"),
+    [string]$SubscriptionId = "77b12327-9e5d-4e1a-a3c5-6e4485a30793",
+    [string]$ResourceGroups = ""
 )
 
 # Show help if requested
@@ -51,6 +53,8 @@ PARAMETERS:
   -DefaultClientName   Name to use for overall subscription analysis (default: 'All Resources')
   -StartDate          Start date for usage analysis (default: May 1, 2025)
   -EndDate            End date for usage analysis (default: May 31, 2025)
+  -SubscriptionId     Azure subscription ID to analyze
+  -ResourceGroups     Comma-separated list of resource groups to filter by (optional, all if empty)
   -ShowDetailedBreakdown Show detailed breakdown by service category
   -Help               Show this help message
 
@@ -63,6 +67,12 @@ EXAMPLES:
   
   # Generate custom date range report
   .\AzureCostsReports.ps1 -StartDate "2025-04-15" -EndDate "2025-04-30"
+  
+  # Filter by specific resource groups
+  .\AzureCostsReports.ps1 -ResourceGroups "rg-prod,rg-test,rg-dev"
+  
+  # Custom subscription and resource group filtering
+  .\AzureCostsReports.ps1 -SubscriptionId "your-sub-id" -ResourceGroups "rg-prod"
 
 REQUIREMENTS:
   - Azure PowerShell module (Az)
@@ -79,22 +89,32 @@ $quotas = @{
         CoreHours = 10000
         DataOutGB = 100
         DataInGB  = 500
+        DiskStorageGB = 1000
+        BlobStorageGB = 500
     }
     "ClientB-Test" = @{
         CoreHours = 2000
         DataOutGB = 50
         DataInGB  = 200
+        DiskStorageGB = 500
+        BlobStorageGB = 200
     }
     $DefaultClientName = @{
         CoreHours = 50000
         DataOutGB = 1000
         DataInGB  = 2000
+        DiskStorageGB = 5000
+        BlobStorageGB = 2000
     }
 }
 
 # VM SKU -> vCPU mapping (will be populated dynamically from Azure APIs)
 $vmSkuCores = @{}
 $vmInstanceData = @{}
+
+# Storage data tracking
+$storageData = @{}
+$diskData = @{}
 
 # Step 1. Connect to Azure
 #Install-Module -Name Az -Scope CurrentUser -Repository PSGallery -Force
@@ -132,18 +152,43 @@ if ($EndDate -gt (Get-Date)) {
 $daySpan = ($EndDate - $StartDate).Days + 1
 Write-Host "Analysis Period: $daySpan days" -ForegroundColor Gray
 
+# Parse resource groups filter if provided
+$resourceGroupsFilter = @()
+if (-not [string]::IsNullOrEmpty($ResourceGroups)) {
+    $resourceGroupsFilter = $ResourceGroups.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrEmpty($_) }
+    Write-Host "Resource Groups Filter: $($resourceGroupsFilter -join ', ')" -ForegroundColor Yellow
+} else {
+    Write-Host "Resource Groups Filter: All resource groups" -ForegroundColor Yellow
+}
+
 # Function to discover VMs and VMSS and populate SKU mapping
 function Get-VMSpecifications {
     Write-Host "`n=== Discovering Virtual Machines and Scale Sets ===" -ForegroundColor Yellow
     
     try {
         # Get all standalone VMs in the subscription
-        $vms = Get-AzVM -Status
-        Write-Host "✓ Found $($vms.Count) standalone virtual machines" -ForegroundColor Green
+        $allVms = Get-AzVM -Status
+        
+        # Apply resource group filter if specified
+        if ($resourceGroupsFilter.Count -gt 0) {
+            $vms = $allVms | Where-Object { $_.ResourceGroupName -in $resourceGroupsFilter }
+            Write-Host "✓ Found $($allVms.Count) total VMs, $($vms.Count) in filtered resource groups" -ForegroundColor Green
+        } else {
+            $vms = $allVms
+            Write-Host "✓ Found $($vms.Count) standalone virtual machines" -ForegroundColor Green
+        }
         
         # Get all Virtual Machine Scale Sets
-        $vmss = Get-AzVmss
-        Write-Host "✓ Found $($vmss.Count) Virtual Machine Scale Sets" -ForegroundColor Green
+        $allVmss = Get-AzVmss
+        
+        # Apply resource group filter if specified
+        if ($resourceGroupsFilter.Count -gt 0) {
+            $vmss = $allVmss | Where-Object { $_.ResourceGroupName -in $resourceGroupsFilter }
+            Write-Host "✓ Found $($allVmss.Count) total VMSS, $($vmss.Count) in filtered resource groups" -ForegroundColor Green
+        } else {
+            $vmss = $allVmss
+            Write-Host "✓ Found $($vmss.Count) Virtual Machine Scale Sets" -ForegroundColor Green
+        }
         
         # Get VMSS instances
         $vmssInstances = @()
@@ -273,12 +318,150 @@ function Get-CoreCountFromVMName {
     return 2
 }
 
+# Function to discover Azure Storage resources
+function Get-StorageSpecifications {
+    Write-Host "`n=== Discovering Azure Storage Resources ===" -ForegroundColor Yellow
+    
+    try {
+        # Get all storage accounts
+        $allStorageAccounts = Get-AzStorageAccount
+        
+        # Apply resource group filter if specified
+        if ($resourceGroupsFilter.Count -gt 0) {
+            $storageAccounts = $allStorageAccounts | Where-Object { $_.ResourceGroupName -in $resourceGroupsFilter }
+            Write-Host "✓ Found $($allStorageAccounts.Count) total storage accounts, $($storageAccounts.Count) in filtered resource groups" -ForegroundColor Green
+        } else {
+            $storageAccounts = $allStorageAccounts
+            Write-Host "✓ Found $($storageAccounts.Count) storage accounts" -ForegroundColor Green
+        }
+        
+        # Get managed disks
+        $allDisks = Get-AzDisk
+        
+        # Apply resource group filter if specified
+        if ($resourceGroupsFilter.Count -gt 0) {
+            $disks = $allDisks | Where-Object { $_.ResourceGroupName -in $resourceGroupsFilter }
+            Write-Host "✓ Found $($allDisks.Count) total managed disks, $($disks.Count) in filtered resource groups" -ForegroundColor Green
+        } else {
+            $disks = $allDisks
+            Write-Host "✓ Found $($disks.Count) managed disks" -ForegroundColor Green
+        }
+        
+        # Process storage accounts
+        foreach ($storageAccount in $storageAccounts) {
+            try {
+                $storageContext = $storageAccount.Context
+                $accountName = $storageAccount.StorageAccountName
+                
+                $storageInfo = @{
+                    ResourceGroup = $storageAccount.ResourceGroupName
+                    Location = $storageAccount.Location
+                    Kind = $storageAccount.Kind
+                    SkuName = $storageAccount.Sku.Name
+                    AccessTier = $storageAccount.AccessTier
+                    Tags = $storageAccount.Tags
+                    BlobContainerCount = 0
+                    BlobSizeGB = 0
+                    FileShareCount = 0
+                    TableCount = 0
+                    QueueCount = 0
+                }
+                
+                # Get blob containers and usage
+                try {
+                    $containers = Get-AzStorageContainer -Context $storageContext
+                    $storageInfo.BlobContainerCount = $containers.Count
+                    
+                    # Estimate blob storage usage (this is simplified - in real scenarios you might want more detailed metrics)
+                    $totalBlobSize = 0
+                    foreach ($container in $containers) {
+                        try {
+                            $blobs = Get-AzStorageBlob -Container $container.Name -Context $storageContext
+                            $containerSize = ($blobs | Measure-Object -Property Length -Sum).Sum
+                            $totalBlobSize += $containerSize
+                        } catch {
+                            # Some containers might not be accessible, continue
+                            Write-Host "  ⚠ Could not access container: $($container.Name)" -ForegroundColor Yellow
+                        }
+                    }
+                    $storageInfo.BlobSizeGB = [math]::Round($totalBlobSize / 1GB, 2)
+                } catch {
+                    Write-Host "  ⚠ Could not access blob storage for: $accountName" -ForegroundColor Yellow
+                }
+                
+                # Get file shares
+                try {
+                    $fileShares = Get-AzStorageShare -Context $storageContext
+                    $storageInfo.FileShareCount = $fileShares.Count
+                } catch {
+                    Write-Host "  ⚠ Could not access file shares for: $accountName" -ForegroundColor Yellow
+                }
+                
+                # Get tables
+                try {
+                    $tables = Get-AzStorageTable -Context $storageContext
+                    $storageInfo.TableCount = $tables.Count
+                } catch {
+                    Write-Host "  ⚠ Could not access tables for: $accountName" -ForegroundColor Yellow
+                }
+                
+                # Get queues
+                try {
+                    $queues = Get-AzStorageQueue -Context $storageContext
+                    $storageInfo.QueueCount = $queues.Count
+                } catch {
+                    Write-Host "  ⚠ Could not access queues for: $accountName" -ForegroundColor Yellow
+                }
+                
+                $storageData[$accountName] = $storageInfo
+                Write-Host "  ✓ $accountName`: $($storageInfo.BlobContainerCount) containers, $($storageInfo.BlobSizeGB) GB blobs, $($storageInfo.FileShareCount) file shares" -ForegroundColor Gray
+                
+            } catch {
+                Write-Host "  ⚠ Failed to process storage account $($storageAccount.StorageAccountName): $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+        
+        # Process managed disks
+        foreach ($disk in $disks) {
+            $diskInfo = @{
+                ResourceGroup = $disk.ResourceGroupName
+                Location = $disk.Location
+                SizeGB = $disk.DiskSizeGB
+                SkuName = $disk.Sku.Name
+                DiskState = $disk.DiskState
+                OsType = $disk.OsType
+                Tags = $disk.Tags
+                AttachedToVM = $disk.OwnerId -ne $null
+            }
+            
+            $diskData[$disk.Name] = $diskInfo
+        }
+        
+        Write-Host "✓ Storage specifications populated successfully" -ForegroundColor Green
+        Write-Host "  Storage Accounts: $($storageData.Count)" -ForegroundColor Gray
+        Write-Host "  Managed Disks: $($diskData.Count)" -ForegroundColor Gray
+        
+        # Calculate total disk storage
+        $totalDiskStorageGB = ($diskData.Values | Measure-Object -Property SizeGB -Sum).Sum
+        $totalBlobStorageGB = ($storageData.Values | Measure-Object -Property BlobSizeGB -Sum).Sum
+        
+        Write-Host "  Total Disk Storage: $totalDiskStorageGB GB" -ForegroundColor Gray
+        Write-Host "  Total Blob Storage: $totalBlobStorageGB GB" -ForegroundColor Gray
+        
+    } catch {
+        Write-Host "⚠ Error discovering storage: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "Storage discovery will be skipped..." -ForegroundColor Yellow
+    }
+}
+
 # Discover VMs and populate specifications
 Get-VMSpecifications
 
+# Discover Storage resources and populate specifications
+Get-StorageSpecifications
+
 # Step 2. Define subscription scope
-$subscriptionId = "77b12327-9e5d-4e1a-a3c5-6e4485a30793"
-$scope = "/subscriptions/$subscriptionId"
+$scope = "/subscriptions/$SubscriptionId"
 
 # Step 3. Define cost query body (with custom date range)
 $aggregation = @{ totalUsage = @{ name = "UsageQuantity"; function = "Sum" } }
@@ -294,7 +477,21 @@ $timePeriod = @{
     from = $StartDate.ToString('yyyy-MM-ddT00:00:00Z')
     to = $EndDate.ToString('yyyy-MM-ddT23:59:59Z')
 }
+
+# Add resource group filter if specified
 $dataset = @{ granularity = "None"; aggregation = $aggregation; grouping = $grouping }
+if ($resourceGroupsFilter.Count -gt 0) {
+    $rgFilter = @{
+        dimension = @{
+            name = "ResourceGroup"
+            operator = "In"
+            values = $resourceGroupsFilter
+        }
+    }
+    $dataset.filter = $rgFilter
+    Write-Host "✓ Added resource group filter to cost query: $($resourceGroupsFilter -join ', ')" -ForegroundColor Green
+}
+
 $body = @{ type = "Usage"; timeframe = "Custom"; timePeriod = $timePeriod; dataset = $dataset } | ConvertTo-Json -Depth 10
 
 # Step 4. Get access token (using alternative method for Cost Management)
@@ -353,6 +550,14 @@ try {
         try {
             Write-Host "Attempting Get-AzUsageDetail..." -ForegroundColor Gray
             $usageDetails = Get-AzUsageDetail -StartDate $StartDate -EndDate $EndDate -MaxCount 1000
+            
+            # Apply resource group filter if specified
+            if ($resourceGroupsFilter.Count -gt 0) {
+                $allUsageDetails = $usageDetails
+                $usageDetails = $usageDetails | Where-Object { $_.ResourceGroupName -in $resourceGroupsFilter }
+                Write-Host "✓ Filtered usage details: $($allUsageDetails.Count) -> $($usageDetails.Count) records" -ForegroundColor Green
+            }
+            
             $dataSource = "Get-AzUsageDetail"
             Write-Host "✓ Get-AzUsageDetail successful" -ForegroundColor Green
         } catch {
@@ -365,6 +570,14 @@ try {
                 Write-Host "Attempting billing-based usage retrieval..." -ForegroundColor Gray
                 # This is a more complex approach that might work better
                 $usageDetails = Get-AzConsumptionUsageDetail -StartDate $StartDate -EndDate $EndDate
+                
+                # Apply resource group filter if specified
+                if ($resourceGroupsFilter.Count -gt 0) {
+                    $allUsageDetails = $usageDetails
+                    $usageDetails = $usageDetails | Where-Object { $_.ResourceGroupName -in $resourceGroupsFilter }
+                    Write-Host "✓ Filtered consumption details: $($allUsageDetails.Count) -> $($usageDetails.Count) records" -ForegroundColor Green
+                }
+                
                 $dataSource = "Get-AzConsumptionUsageDetail"
                 Write-Host "✓ Billing-based retrieval successful" -ForegroundColor Green
             } catch {
@@ -385,7 +598,7 @@ try {
                     $totalCoreHours = $resourceInfo.TotalCores * $hoursInPeriod
                     
                     $estimatedUsage += [PSCustomObject]@{
-                        ResourceId = "/subscriptions/$subscriptionId/resourceGroups/$($resourceInfo.ResourceGroup)/providers/Microsoft.Compute/virtualMachineScaleSets/$($resource.Key)"
+                        ResourceId = "/subscriptions/$SubscriptionId/resourceGroups/$($resourceInfo.ResourceGroup)/providers/Microsoft.Compute/virtualMachineScaleSets/$($resource.Key)"
                         MeterCategory = "Virtual Machines"
                         MeterSubCategory = $resourceInfo.Size
                         MeterName = "Compute Hours"
@@ -402,7 +615,7 @@ try {
                     $coreHours = $resourceInfo.Cores * $hoursInPeriod
                     
                     $estimatedUsage += [PSCustomObject]@{
-                        ResourceId = "/subscriptions/$subscriptionId/resourceGroups/$($resourceInfo.ResourceGroup)/providers/Microsoft.Compute/virtualMachines/$($resource.Key)"
+                        ResourceId = "/subscriptions/$SubscriptionId/resourceGroups/$($resourceInfo.ResourceGroup)/providers/Microsoft.Compute/virtualMachines/$($resource.Key)"
                         MeterCategory = "Virtual Machines"
                         MeterSubCategory = $resourceInfo.Size
                         MeterName = "Compute Hours"
@@ -463,14 +676,22 @@ if ($useRestAPI) {
     $data = $response.properties.rows
 }
 
-# Step 7. Aggregate usage per client (enhanced with dynamic VM SKU data)
+# Step 7. Aggregate usage per client (enhanced with dynamic VM SKU data and storage)
 $clientUsage = @{}
 foreach ($row in $data) {
     $clientTag = $row.Tag
     if ([string]::IsNullOrEmpty($clientTag)) { 
         $clientTag = if ($UseClientTags) { "Unknown" } else { $DefaultClientName }
     }
-    if (-not $clientUsage.ContainsKey($clientTag)) { $clientUsage[$clientTag] = @{ CoreHours = 0; DataOutGB = 0; DataInGB = 0 } }
+    if (-not $clientUsage.ContainsKey($clientTag)) { 
+        $clientUsage[$clientTag] = @{ 
+            CoreHours = 0; 
+            DataOutGB = 0; 
+            DataInGB = 0; 
+            DiskStorageGB = 0; 
+            BlobStorageGB = 0 
+        } 
+    }
     
     switch ($row.MeterCategory) {
         "Virtual Machines" { 
@@ -492,6 +713,14 @@ foreach ($row in $data) {
             }
             $clientUsage[$clientTag].CoreHours += ($row.UsageQuantity * $cores)
         }
+        "Storage" { 
+            # Handle different storage types
+            if ($row.MeterSubCategory -match "Disk|SSD|HDD") {
+                $clientUsage[$clientTag].DiskStorageGB += $row.UsageQuantity
+            } elseif ($row.MeterSubCategory -match "Blob|Object") {
+                $clientUsage[$clientTag].BlobStorageGB += $row.UsageQuantity
+            }
+        }
         "Networking" { 
             if ($row.MeterSubCategory -match "Data Out") { 
                 $clientUsage[$clientTag].DataOutGB += $row.UsageQuantity 
@@ -502,7 +731,56 @@ foreach ($row in $data) {
     }
 }
 
-# Step 8. Compare with quotas (single line approach with flexible quota handling)
+# Add discovered storage usage to aggregated data
+Write-Host "`n=== Adding Discovered Storage Usage ===" -ForegroundColor Yellow
+
+# Add storage account usage by client tag or default
+foreach ($storageAccount in $storageData.GetEnumerator()) {
+    $storageInfo = $storageAccount.Value
+    $clientTag = if ($UseClientTags -and $storageInfo.Tags -and $storageInfo.Tags.ContainsKey("Client")) { 
+        $storageInfo.Tags["Client"] 
+    } else { 
+        $DefaultClientName 
+    }
+    
+    if (-not $clientUsage.ContainsKey($clientTag)) { 
+        $clientUsage[$clientTag] = @{ 
+            CoreHours = 0; 
+            DataOutGB = 0; 
+            DataInGB = 0; 
+            DiskStorageGB = 0; 
+            BlobStorageGB = 0 
+        } 
+    }
+    
+    $clientUsage[$clientTag].BlobStorageGB += $storageInfo.BlobSizeGB
+    Write-Host "  ✓ Added blob storage for $($storageAccount.Key): $($storageInfo.BlobSizeGB) GB -> $clientTag" -ForegroundColor Gray
+}
+
+# Add managed disk usage by client tag or default
+foreach ($disk in $diskData.GetEnumerator()) {
+    $diskInfo = $disk.Value
+    $clientTag = if ($UseClientTags -and $diskInfo.Tags -and $diskInfo.Tags.ContainsKey("Client")) { 
+        $diskInfo.Tags["Client"] 
+    } else { 
+        $DefaultClientName 
+    }
+    
+    if (-not $clientUsage.ContainsKey($clientTag)) { 
+        $clientUsage[$clientTag] = @{ 
+            CoreHours = 0; 
+            DataOutGB = 0; 
+            DataInGB = 0; 
+            DiskStorageGB = 0; 
+            BlobStorageGB = 0 
+        } 
+    }
+    
+    $clientUsage[$clientTag].DiskStorageGB += $diskInfo.SizeGB
+    Write-Host "  ✓ Added disk storage for $($disk.Key): $($diskInfo.SizeGB) GB -> $clientTag" -ForegroundColor Gray
+}
+
+# Step 8. Compare with quotas (enhanced with storage metrics)
 $reports = foreach ($client in $clientUsage.Keys) {
     $usage = $clientUsage[$client]; $quota = $quotas[$client]
     
@@ -513,6 +791,8 @@ $reports = foreach ($client in $clientUsage.Keys) {
             CoreHours = [math]::Round($usage.CoreHours,2); 
             DataOutGB = [math]::Round($usage.DataOutGB,2); 
             DataInGB = [math]::Round($usage.DataInGB,2);
+            DiskStorageGB = [math]::Round($usage.DiskStorageGB,2);
+            BlobStorageGB = [math]::Round($usage.BlobStorageGB,2);
             Mode = "Usage Only (No Quota Defined)"
         }
     } elseif ($null -ne $quota) {
@@ -524,6 +804,10 @@ $reports = foreach ($client in $clientUsage.Keys) {
             DataOutRemain = [math]::Round($quota.DataOutGB - $usage.DataOutGB,2); 
             DataInGB = "$([math]::Round($usage.DataInGB,2)) / $($quota.DataInGB)"; 
             DataInRemain = [math]::Round($quota.DataInGB - $usage.DataInGB,2);
+            DiskStorageGB = "$([math]::Round($usage.DiskStorageGB,2)) / $($quota.DiskStorageGB)";
+            DiskRemain = [math]::Round($quota.DiskStorageGB - $usage.DiskStorageGB,2);
+            BlobStorageGB = "$([math]::Round($usage.BlobStorageGB,2)) / $($quota.BlobStorageGB)";
+            BlobRemain = [math]::Round($quota.BlobStorageGB - $usage.BlobStorageGB,2);
             Mode = "Usage vs Quota"
         }
     } elseif ($UseClientTags) {
@@ -532,6 +816,8 @@ $reports = foreach ($client in $clientUsage.Keys) {
             CoreHours = [math]::Round($usage.CoreHours,2); 
             DataOutGB = [math]::Round($usage.DataOutGB,2); 
             DataInGB = [math]::Round($usage.DataInGB,2);
+            DiskStorageGB = [math]::Round($usage.DiskStorageGB,2);
+            BlobStorageGB = [math]::Round($usage.BlobStorageGB,2);
             Mode = "Usage Only (No Quota for Client)"
         }
     }
@@ -552,10 +838,14 @@ if ($reports) {
         $totalCoreHours = ($clientUsage.Values | Measure-Object -Property CoreHours -Sum).Sum
         $totalDataOut = ($clientUsage.Values | Measure-Object -Property DataOutGB -Sum).Sum
         $totalDataIn = ($clientUsage.Values | Measure-Object -Property DataInGB -Sum).Sum
+        $totalDiskStorage = ($clientUsage.Values | Measure-Object -Property DiskStorageGB -Sum).Sum
+        $totalBlobStorage = ($clientUsage.Values | Measure-Object -Property BlobStorageGB -Sum).Sum
         
         Write-Host "Total Core Hours: $([math]::Round($totalCoreHours,2))" -ForegroundColor White
         Write-Host "Total Data Out (GB): $([math]::Round($totalDataOut,2))" -ForegroundColor White
         Write-Host "Total Data In (GB): $([math]::Round($totalDataIn,2))" -ForegroundColor White
+        Write-Host "Total Disk Storage (GB): $([math]::Round($totalDiskStorage,2))" -ForegroundColor White
+        Write-Host "Total Blob Storage (GB): $([math]::Round($totalBlobStorage,2))" -ForegroundColor White
         Write-Host "Analysis Period: $($StartDate.ToString('yyyy-MM-dd')) to $($EndDate.ToString('yyyy-MM-dd')) ($daySpan days)" -ForegroundColor Yellow
         
         # Show detailed breakdown if requested
@@ -624,6 +914,91 @@ if ($reports) {
                     }
                 } | Sort-Object TotalCores -Descending
                 $skuSummary | Format-Table -AutoSize
+            }
+        }
+        
+        # Show storage resources summary
+        if ($storageData.Count -gt 0 -or $diskData.Count -gt 0) {
+            Write-Host "`n=== STORAGE RESOURCES DISCOVERY SUMMARY ===" -ForegroundColor Cyan
+            $storageAccountCount = $storageData.Count
+            $diskCount = $diskData.Count
+            $totalBlobContainers = ($storageData.Values | Measure-Object -Property BlobContainerCount -Sum).Sum
+            $totalFileShares = ($storageData.Values | Measure-Object -Property FileShareCount -Sum).Sum
+            $totalBlobStorage = ($storageData.Values | Measure-Object -Property BlobSizeGB -Sum).Sum
+            $totalDiskStorage = ($diskData.Values | Measure-Object -Property SizeGB -Sum).Sum
+            
+            Write-Host "Storage Accounts: $storageAccountCount" -ForegroundColor White
+            Write-Host "Managed Disks: $diskCount" -ForegroundColor White
+            Write-Host "Total Blob Containers: $totalBlobContainers" -ForegroundColor White
+            Write-Host "Total File Shares: $totalFileShares" -ForegroundColor White
+            Write-Host "Total Blob Storage: $([math]::Round($totalBlobStorage, 2)) GB" -ForegroundColor White
+            Write-Host "Total Disk Storage: $([math]::Round($totalDiskStorage, 2)) GB" -ForegroundColor White
+            
+            if ($storageAccountCount -le 10) {
+                # Show all storage accounts if 10 or fewer
+                Write-Host "`nStorage Account Details:" -ForegroundColor Gray
+                $storageSummary = $storageData.GetEnumerator() | ForEach-Object {
+                    $storage = $_.Value
+                    [PSCustomObject]@{
+                        Name = $_.Key
+                        ResourceGroup = $storage.ResourceGroup
+                        Kind = $storage.Kind
+                        SKU = $storage.SkuName
+                        Containers = $storage.BlobContainerCount
+                        "BlobSize(GB)" = [math]::Round($storage.BlobSizeGB, 2)
+                        FileShares = $storage.FileShareCount
+                        ClientTag = if ($storage.Tags -and $storage.Tags.ContainsKey("Client")) { $storage.Tags["Client"] } else { "None" }
+                    }
+                } | Sort-Object "BlobSize(GB)" -Descending
+                $storageSummary | Format-Table -AutoSize
+            } else {
+                # Show summary by SKU type
+                Write-Host "`nStorage SKU Summary:" -ForegroundColor Gray
+                $skuSummary = $storageData.Values | Group-Object SkuName | ForEach-Object {
+                    $sku = $_.Name
+                    $accounts = $_.Group
+                    $totalBlob = ($accounts | Measure-Object -Property BlobSizeGB -Sum).Sum
+                    
+                    [PSCustomObject]@{
+                        SKU = $sku
+                        AccountCount = $accounts.Count
+                        "TotalBlobStorage(GB)" = [math]::Round($totalBlob, 2)
+                    }
+                } | Sort-Object "TotalBlobStorage(GB)" -Descending
+                $skuSummary | Format-Table -AutoSize
+            }
+            
+            if ($diskCount -le 15) {
+                # Show disk summary
+                Write-Host "`nManaged Disk Details:" -ForegroundColor Gray
+                $diskSummary = $diskData.GetEnumerator() | ForEach-Object {
+                    $disk = $_.Value
+                    [PSCustomObject]@{
+                        Name = $_.Key
+                        ResourceGroup = $disk.ResourceGroup
+                        "Size(GB)" = $disk.SizeGB
+                        SKU = $disk.SkuName
+                        State = $disk.DiskState
+                        Attached = $disk.AttachedToVM
+                        ClientTag = if ($disk.Tags -and $disk.Tags.ContainsKey("Client")) { $disk.Tags["Client"] } else { "None" }
+                    }
+                } | Sort-Object "Size(GB)" -Descending
+                $diskSummary | Format-Table -AutoSize
+            } else {
+                # Show disk summary by SKU
+                Write-Host "`nDisk SKU Summary:" -ForegroundColor Gray
+                $diskSkuSummary = $diskData.Values | Group-Object SkuName | ForEach-Object {
+                    $sku = $_.Name
+                    $disks = $_.Group
+                    $totalSize = ($disks | Measure-Object -Property SizeGB -Sum).Sum
+                    
+                    [PSCustomObject]@{
+                        SKU = $sku
+                        DiskCount = $disks.Count
+                        "TotalStorage(GB)" = $totalSize
+                    }
+                } | Sort-Object "TotalStorage(GB)" -Descending
+                $diskSkuSummary | Format-Table -AutoSize
             }
         }
     }
